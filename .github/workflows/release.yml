@@ -1,0 +1,205 @@
+name: Release
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        targets: [
+          { os: ubuntu-latest, type: linux },
+          { os: macos-latest,  type: macos },
+          { os: macos-latest,  type: macstore },
+          { os: windows-2022,  type: windows },
+          { os: macos-latest,  type: ios },
+          { os: windows-2022,  type: android }
+        ]
+    name: Gyroflow for ${{ matrix.targets.type }}
+    runs-on: ${{ matrix.targets.os }}
+    env:
+      BUILD_APP_STORE_BUNDLE: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+      IS_MANUAL_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: 1.72.1
+          profile: minimal
+          override: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.targets.type }}-gyroflow-0
+      - name: Dependencies cache
+        id: extcache
+        uses: actions/cache@v3
+        with:
+          path: '${{ github.workspace }}/ext/'
+          key: ${{ matrix.targets.type }}-gyroflow-ext-0
+
+      - name: Prepare Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@v1.2.0
+        with:
+          vulkan-query-version: 1.3.204.0
+          vulkan-components: Vulkan-Headers
+          vulkan-use-cache: true
+
+      - name: Force qml-video-rs rebuild (UNIX)
+        if: ${{ matrix.targets.os != 'windows-2022' }}
+        run: |
+          rm -rf ${{ github.workspace }}/target/*/deploy/build/qml-video-rs*
+          rm -rf ${{ github.workspace }}/target/deploy/build/qml-video-rs*
+      - name: Force qml-video-rs rebuild (Win)
+        if: ${{ matrix.targets.os == 'windows-2022' }}
+        run: |
+          rm -r -force ${{ github.workspace }}/target/deploy/build/qml-video-rs* -ErrorAction SilentlyContinue
+          rm -r -force ${{ github.workspace }}/target/release/build/qml-video-rs* -ErrorAction SilentlyContinue
+
+      - name: Install Mac certificates
+        if: ${{ matrix.targets.os == 'macos-latest' }}
+        uses: apple-actions/import-codesign-certs@v2
+        with:
+          p12-file-base64: ${{ secrets.MACOS_CERTIFICATES }}
+          p12-password: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+      - name: Download Provisioning Profiles
+        if: ${{ matrix.targets.type == 'ios' }}
+        id: provisioning
+        uses: apple-actions/download-provisioning-profiles@v2
+        with:
+          bundle-id: 'xyz.gyroflow'
+          profile-type: 'IOS_APP_STORE'
+          issuer-id: ${{ secrets.MACOS_ITCONNECT_ISSUER }}
+          api-key-id: ${{ secrets.MACOS_ITCONNECT_KEY_ID }}
+          api-private-key: ${{ secrets.MACOS_ITCONNECT_KEY }}
+      - name: Download Provisioning Profiles
+        if: ${{ matrix.targets.type == 'macstore' }}
+        id: provisioning_mac
+        uses: apple-actions/download-provisioning-profiles@v2
+        with:
+          bundle-id: 'xyz.gyroflow'
+          profile-type: 'MAC_APP_STORE'
+          issuer-id: ${{ secrets.MACOS_ITCONNECT_ISSUER }}
+          api-key-id: ${{ secrets.MACOS_ITCONNECT_KEY_ID }}
+          api-private-key: ${{ secrets.MACOS_ITCONNECT_KEY }}
+
+      - name: Save keystore to file
+        if: ${{ matrix.targets.os == 'windows-2022' }}
+        run: |
+          echo "${{ secrets.ANDROID_RELEASE_KEYSTORE }}" > ${{ github.workspace }}/android_release.keystore.b64
+          echo "${{ secrets.MS_STORE_SIGNING_KEY }}" > ${{ github.workspace }}/_deployment/windows/msix_signing_key.pfx.b64
+          certutil -decode ${{ github.workspace }}/android_release.keystore.b64 ${{ github.workspace }}/android_release.keystore
+          certutil -decode ${{ github.workspace }}/_deployment/windows/msix_signing_key.pfx.b64 ${{ github.workspace }}/_deployment/windows/msix_signing_key.pfx
+
+      - uses: extractions/setup-just@v1
+
+      - name: Build Gyroflow (macOS)
+        if: ${{ matrix.targets.type == 'macos' }}
+        env:
+          SIGNING_FINGERPRINT: ${{ secrets.MACOS_CERTIFICATE_FINGERPRINT }}
+        run: |
+          just install-deps
+          just deploy universal
+          xcrun notarytool submit --wait --apple-id ${{ secrets.MACOS_ACCOUNT_USER }} --team-id ${{ secrets.MACOS_TEAM }} --password ${{ secrets.MACOS_ACCOUNT_PASS }} ${{ github.workspace }}/_deployment/_binaries/Gyroflow-mac-universal.dmg
+          xcrun stapler staple --verbose ${{ github.workspace }}/_deployment/_binaries/Gyroflow-mac-universal.dmg
+
+      - name: Build Gyroflow (macOS App Store)
+        if: ${{ matrix.targets.type == 'macstore' && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') }}
+        env:
+          SIGNING_FINGERPRINT: ${{ secrets.MACOS_CERTIFICATE_FINGERPRINT }}
+          # For Mac App Store
+          SIGN_KEY: 7F82D6013B8F6D45F88FE547438744BD64750C5B
+          PKG_SIGN_KEY: DC70831576E7B2345E78A516BEA2FC34D18F42F5
+          PROVISIONING_PROFILE: /Users/runner/Library/MobileDevice/Provisioning Profiles/${{ matrix.targets.type == 'macstore' && fromJSON(steps.provisioning_mac.outputs.profiles)[0].udid || '' }}.mobileprovision
+          FORCE_QT_VERSION: 6.6.1
+          DONT_BUILD_DMG: true
+        run: |
+          /usr/libexec/PlistBuddy -x -c "Set :LSMinimumSystemVersion \"11.0\"" ${{ github.workspace }}/_deployment/mac/Gyroflow.app/Contents/Info.plist
+          sed -i -e 's/"10.11"/"11.0"/' ${{ github.workspace }}/_scripts/macos.just
+          just install-deps
+          just deploy universal
+          just bundle
+
+      - name: Build Gyroflow (Linux)
+        if: ${{ matrix.targets.type == 'linux' }}
+        run: just deploy docker
+
+      - name: Build Gyroflow (Windows)
+        if: ${{ matrix.targets.type == 'windows' }}
+        env:
+          MS_STORE_SIGNING_PASS: ${{ secrets.MS_STORE_SIGNING_PASS }}
+        run: |
+          just install-deps
+          just deploy
+          if ("$Env:BUILD_APP_STORE_BUNDLE" -eq "true") { just bundle }
+
+      - name: Build Gyroflow (Android)
+        if: ${{ matrix.targets.type == 'android' }}
+        env:
+          KEY_STORE_PATH: ${{ github.workspace }}/android_release.keystore
+          KEY_STORE_ALIAS: ${{ secrets.ANDROID_RELEASE_KEYSTORE_ALIAS }}
+          KEY_STORE_PASS: ${{ secrets.ANDROID_RELEASE_KEYSTORE_PASS }}
+          BUILD_PROFILE: deploy
+        run: |
+          $Env:JAVA_HOME = $Env:JAVA_HOME_17_X64
+          just android install-deps
+          just android deploy
+
+      - name: Build Gyroflow (iOS)
+        if: ${{ matrix.targets.type == 'ios' }}
+        env:
+          SIGN_KEY: 7F82D6013B8F6D45F88FE547438744BD64750C5B
+          PROVISIONING_PROFILE: /Users/runner/Library/MobileDevice/Provisioning Profiles/${{ matrix.targets.type == 'ios' && fromJSON(steps.provisioning.outputs.profiles)[0].udid || '' }}.mobileprovision
+        run: |
+          just ios install-deps
+          just ios build-ipa
+
+      - name: Save debug symbols
+        if: ${{ matrix.targets.type == 'windows' }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: Gyroflow-debug-symbols
+          path: |
+            ${{ github.workspace }}/target/deploy/deps/gyroflow.pdb
+            ${{ github.workspace }}/target/deploy/*.pdb
+      - name: Save Binaries
+        uses: actions/upload-artifact@v3
+        with:
+          name: Gyroflow-${{ matrix.targets.type }}
+          path: _deployment/_binaries/*.*
+
+  github_release:
+    name: Create GitHub release
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v3
+
+      - run: find . -type f
+
+      - if: startsWith(github.ref, 'refs/tags/')
+        run: rm -rf ./Gyroflow-debug-symbols
+
+      - name: Upload to App Store
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        run: |
+          xcrun altool --upload-app -f ./Gyroflow-ios/Gyroflow.ipa -t iOS -u ${{ secrets.MACOS_ACCOUNT_USER }} -p ${{ secrets.MACOS_ACCOUNT_PASS }}
+          xcrun altool --upload-app -f ./Gyroflow-macstore/Gyroflow.pkg -t macos -u ${{ secrets.MACOS_ACCOUNT_USER }} -p ${{ secrets.MACOS_ACCOUNT_PASS }}
+
+      - name: Upload to Google Play
+        uses: r0adkll/upload-google-play@v1
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.ANDROID_SERVICE_ACCOUNT_JSON }}
+          packageName: xyz.gyroflow
+          releaseFiles: ./Gyroflow-android/Gyroflow.aab
+          track: ${{ startsWith(github.ref, 'refs/tags/') && 'production' || 'beta' }}
+
+      - name: Publish
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+         files: ./**/*
